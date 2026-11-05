@@ -38,15 +38,9 @@ Nothing runs in the background. The only thing written to disk is `~/.local/shar
 
 The result includes `formatting_instructions`, so Cursor writes a table of **Project | Timelog Description | Time | Hours** in clear, grammatical, past-tense English with a total.
 
-## Install / upgrade
+## Install
 
-```bash
-cd cursor-timelog-mcp
-chmod +x scripts/*.sh
-./scripts/install.sh
-```
-
-Then in Cursor: Settings → Tools & MCP → toggle `cursor-timelog` off and on (or restart Cursor). Ask: `timelog`.
+Step-by-step Ubuntu commands are in [INSTALL.md](INSTALL.md).
 
 ## Limits
 
