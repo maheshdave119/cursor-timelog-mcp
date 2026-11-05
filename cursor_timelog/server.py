@@ -29,7 +29,9 @@ from typing import Any, Iterable
 from urllib.parse import unquote, urlparse
 from zoneinfo import ZoneInfo
 
-VERSION = "2.0.0"
+from .narrative import cluster_beats, narrate, narrate_commits
+
+VERSION = "2.1.0"
 
 HOME = Path.home()
 USER_DIR = Path(os.environ.get("CURSOR_USER_DIR", HOME / ".config/Cursor/User")).expanduser()
@@ -465,7 +467,22 @@ def summarize_turn(turn: dict[str, Any]) -> dict[str, Any]:
                 tools["mcp"] += 1
         if bubble["type"] == 2 and bubble["text"].strip():
             final = bubble["text"]
-    return {"edited": edited, "tools": dict(tools), "final": final}
+    return {"edited": edited, "tools": dict(tools), "final": final, "finding": _finding(final)}
+
+
+def _finding(text: str) -> str:
+    """Keep one concrete sentence from an assistant reply. Later replies must not erase it."""
+    text = re.sub(r"\s+", " ", text or "").strip()
+    text = re.sub(r"^I['’]ll\s+", "", text)
+    text = re.sub(r"^I\s+", "", text)
+    if not text:
+        return ""
+    sentence = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0]
+    if len(sentence) < 40 or sentence.lower().startswith(("yes", "no", "mostly", "ok", "sure")):
+        return ""
+    if sentence[-1] not in ".!?":
+        sentence += "."
+    return sentence[:360]
 
 
 def categorize(requests: list[str], edited: list[str], tools: dict[str, int]) -> str:
@@ -571,7 +588,7 @@ def build_chat_tasks(day: date, workspaces: list[dict[str, Any]]) -> tuple[list[
     def add_turns(cid: str, title: str, default_project: str, turns: list[dict[str, Any]]) -> None:
         for turn in turns:
             user_text = turn.get("user", "")
-            info = turn.get("info") or {"edited": [], "tools": {}, "final": turn.get("final", "")}
+            info = turn.get("info") or {"edited": [], "tools": {}, "final": turn.get("final", ""), "finding": ""}
             if user_text and (is_meta_turn(user_text) or (
                     META_RE.search(clean_text(user_text, 800)) and not info["edited"])):
                 continue  # asking for / complaining about the timelog itself is not work to be logged
@@ -586,13 +603,22 @@ def build_chat_tasks(day: date, workspaces: list[dict[str, Any]]) -> tuple[list[
                     project = max(counts, key=counts.get)
             task = tasks.setdefault((cid, project), {
                 "chat_id": cid, "project": project, "title": title, "intervals": [], "requests": [],
-                "outcomes": [], "edited": [], "tools": defaultdict(int), "source": "cursor_chat"})
+                "outcomes": [], "beats": [], "edited": [], "tools": defaultdict(int), "source": "cursor_chat"})
             task["intervals"].append((turn["start"], turn["end"]))
-            request = clean_text(user_text)
+            request = clean_text(user_text, 500)
             if request and request not in task["requests"]:
                 task["requests"].append(request)
+            finding = info.get("finding") or ""
+            if request or finding:
+                # Every turn is retained. A later message in the same tab must not replace this one.
+                task["beats"].append({
+                    "request": user_text.strip() if user_text else request,
+                    "finding": finding,
+                    "start": turn["start"],
+                    "end": turn["end"],
+                })
             outcome = clean_outcome(info["final"])
-            if outcome:
+            if outcome and outcome not in task["outcomes"]:
                 task["outcomes"].append(outcome)
             for path in info["edited"]:
                 if path not in task["edited"]:
@@ -770,6 +796,38 @@ def parse_hours(value: str) -> float | None:
 # --------------------------------------------------------------------------------------
 
 
+def _title_line(title: str) -> str:
+    title = re.sub(r"\s+", " ", title or "").strip(" .")
+    if not title:
+        return ""
+    return "Worked on " + title[0].lower() + title[1:] + "."
+
+
+def _split_chat_task(task: dict[str, Any]) -> list[dict[str, Any]]:
+    """One chat tab can hold several pieces of work. Keep all of them as separate summaries."""
+    beats = [beat for beat in task.get("beats") or [] if (beat.get("request") or "").strip()]
+    groups = cluster_beats(beats) if len(beats) > 1 else ([beats] if beats else [])
+    if len(groups) <= 1:
+        if groups:
+            task["requests"] = [beat["request"] for beat in groups[0]] or task["requests"]
+        task["description"] = narrate(task["requests"]) or _title_line(task.get("title") or "")
+        return [task]
+    pieces = []
+    for group in groups:
+        requests = [beat["request"] for beat in group if beat.get("request")]
+        intervals = [(beat["start"], beat["end"]) for beat in group if beat.get("start") is not None and beat.get("end") is not None]
+        piece = dict(task)
+        piece["intervals"] = intervals or list(task["intervals"])
+        piece["requests"] = requests
+        piece["beats"] = group
+        piece["outcomes"] = [beat["finding"] for beat in group if beat.get("finding")] or list(task["outcomes"])
+        piece["edited"] = list(task["edited"])
+        piece["description"] = narrate(requests) or _title_line(task.get("title") or "")
+        pieces.append(piece)
+    described = [piece for piece in pieces if piece.get("description")]
+    return described or pieces
+
+
 def _short_files(paths: list[str], limit: int = 10) -> list[str]:
     names: list[str] = []
     for path in paths:
@@ -804,12 +862,17 @@ def build_timelog(day: date, project_filter: str = "", topic_filter: str = "") -
     for task in chat_tasks:
         if not task["intervals"]:
             continue
-        sessions = merge_intervals(task["intervals"], IDLE_GAP_SECONDS)
-        task["sessions"] = sessions
-        task["first"] = sessions[0][0]
-        task["last"] = sessions[-1][1]
-        task["category"] = categorize(task["requests"], task["edited"], dict(task["tools"]))
-        by_project[task["project"]].append(task)
+        for piece in _split_chat_task(task):
+            if not piece["intervals"]:
+                continue
+            sessions = merge_intervals(piece["intervals"], IDLE_GAP_SECONDS)
+            piece["sessions"] = sessions
+            piece["first"] = sessions[0][0]
+            piece["last"] = sessions[-1][1]
+            piece["category"] = categorize(piece["requests"], piece["edited"], dict(piece["tools"]))
+            if not piece.get("description"):
+                piece["description"] = narrate(piece["requests"])
+            by_project[piece["project"]].append(piece)
 
     # --- manual-edit tasks for files changed outside any chat session ----------------
     for name, items in files.items():
@@ -834,6 +897,7 @@ def build_timelog(day: date, project_filter: str = "", topic_filter: str = "") -
                 "intervals": [(first, last)], "sessions": [(first, last)],
                 "first": first, "last": last, "category": "Development",
                 "requests": [], "outcomes": [], "edited": [r for _, r in cluster], "tools": {},
+                "description": "Edited " + ", ".join(_short_files([r for _, r in cluster], 5)) + " directly in the editor.",
             })
 
     # --- manual entries --------------------------------------------------------------
@@ -873,7 +937,7 @@ def build_timelog(day: date, project_filter: str = "", topic_filter: str = "") -
                     "chat_id": "", "project": name, "title": "Source control commits", "source": "git_commits",
                     "intervals": [(first, last)], "sessions": [(first, last)], "first": first, "last": last,
                     "category": "Development", "requests": [], "outcomes": [c["message"] for c in cluster],
-                    "edited": [], "tools": {},
+                    "edited": [], "tools": {}, "description": narrate_commits([c["message"] for c in cluster]),
                 })
             else:
                 pending.extend(cluster)
@@ -883,6 +947,7 @@ def build_timelog(day: date, project_filter: str = "", topic_filter: str = "") -
                 "intervals": [], "sessions": [], "first": pending[0]["ts"], "last": pending[-1]["ts"],
                 "category": "Development", "requests": [], "outcomes": [c["message"] for c in pending][:12],
                 "edited": [], "tools": {}, "commit_times": [fmt_time(c["ts"]) for c in pending],
+                "description": narrate_commits([c["message"] for c in pending]),
             })
 
     # --- allocate minutes so project totals equal the sum of their tasks -------------
@@ -921,6 +986,7 @@ def build_timelog(day: date, project_filter: str = "", topic_filter: str = "") -
             edited = _short_files(task["edited"])
             task_out.append({
                 "task": task["title"] or (task["requests"][0] if task["requests"] else "Untitled task"),
+                "description": task.get("description") or "",
                 "category": task["category"],
                 "source": task["source"],
                 "time": ", ".join(fmt_range(a, b) for a, b in task["sessions"][:4]) + (" ..." if len(task["sessions"]) > 4 else "")
@@ -930,8 +996,8 @@ def build_timelog(day: date, project_filter: str = "", topic_filter: str = "") -
                 "hours": round(minutes / 60, 2) if minutes is not None else None,
                 "duration": fmt_duration(minutes),
                 "hours_note": note,
-                "user_requests": task["requests"][:8],
-                "outcomes": task["outcomes"][-3:],
+                "user_requests": task["requests"][:40],
+                "outcomes": task["outcomes"][:20],
                 "files_changed": edited,
                 "files_changed_count": len(task["edited"]),
                 "activity": dict(task["tools"]),
@@ -997,11 +1063,10 @@ FORMATTING_INSTRUCTIONS = (
     "Write the daily timelog in clear, professional, grammatically correct English. Use ONLY the data in this result; "
     "never invent tasks, times or hours. Output one markdown table with the columns "
     "Project | Timelog Description | Time | Hours, ordered by time of day, then a bold total line. "
-    "Rules: (1) One row per task (merge tasks that are clearly the same piece of work). "
-    "(2) Write the description as one or two concise past-tense sentences that start with a verb, for example "
-    "'Reviewed the custom cron jobs and documented how to verify them safely.' Derive it from the task title, "
-    "user_requests and outcomes; correct spelling and grammar from the user's requests; remove IDs, file-system noise and "
-    "tool names; never mention the timelog tool itself. (3) Use the task's 'time' value for Time (12-hour AM/PM) and "
+    "Rules: (1) One row per task. Do not merge tasks, and do not drop a task because it happened in the same "
+    "project or the same Cursor tab as another task. (2) Use each task's description field as the timelog text. "
+    "It already summarises every activity in that task in developer wording. Do not replace it with only the last "
+    "user_request or the last outcome. (3) Use the task's 'time' value for Time (12-hour AM/PM) and "
     "its 'duration' for Hours, as '0.67 h (40 min)'; if minutes is null write 'To be confirmed'; if minutes is 0 merge the "
     "row into the overlapping task. (4) Show each project's name as given; group the Project column by project. "
     "(5) Use total_hours for the total; say hours are approximate, based on first-to-last message time with breaks over 30 "
